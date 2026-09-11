@@ -1,0 +1,22 @@
+name: Re-run agent PR rules on review
+
+on:
+  workflow_call:
+
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA" \
+            --jq '[.workflow_runs[] | select(.status == "completed") | select(.path | test("/agent-pr-rules\\.ya?ml"))] | sort_by(.run_started_at) | last | .id')
+          if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
+            # gh run rerun 404s on ruleset-injected runs (their workflow_id
+            # belongs to the source repo), so call the REST endpoint directly
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/rerun"
+          else
+            echo "No agent-pr-rules run found for $HEAD_SHA"
+          fi

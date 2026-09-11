@@ -1,0 +1,101 @@
+name: Enforce agent PR approvals
+
+on:
+  workflow_call:
+    secrets:
+      ORG_READ_TOKEN:
+        description: Token with read:org + pull-requests:read (default GITHUB_TOKEN can't read team membership).
+        required: true
+
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  agent-pr-rules-centaur-skip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require 2 human approvals for agent PRs
+        env:
+          # Needs read:org (to list team members) + pull-requests:read. The
+          # default GITHUB_TOKEN cannot read org team membership, so a PAT or
+          # GitHub App token is required here.
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Slug of the GitHub team whose members count as humans. Anyone not on
+          # this team (including bots/agents) is treated as an agent PR author,
+          # and only approvals from team members count toward the gate.
+          TEAM_SLUG: humans
+        run: |
+          set -euo pipefail
+
+          # Whitelist of human logins, from the team's membership.
+          HUMANS_JSON=$(gh api --paginate "orgs/${ORG}/teams/${TEAM_SLUG}/members" \
+            -q '.[].login' \
+            | jq -R 'ascii_downcase' \
+            | jq -s 'map(select(. != ""))')
+
+          echo "Team @${ORG}/${TEAM_SLUG} has $(echo "$HUMANS_JSON" | jq 'length') member(s)."
+
+          AUTHOR_LC=$(printf '%s' "$AUTHOR" | tr '[:upper:]' '[:lower:]')
+
+          # Exempt Dependabot's dependency-update PRs from the gate. The author
+          # login can't be spoofed (reserved bot slug), but user.login is fixed
+          # at open time, so a PR modified by Gerard still looks Dependabot-authored.
+          # Only exempt PURE Dependabot PRs (all commits authored by Dependabot);
+          # a modified one falls through to the agent gate (2 human approvals).
+          if [ "$AUTHOR_LC" = "dependabot[bot]" ]; then
+            # true only if >=1 commit and every commit is authored by Dependabot.
+            # A null/missing author login fails, so the safe default is no exemption.
+            DEPENDABOT_ONLY=$(gh api --paginate "repos/${REPO}/pulls/${PR}/commits" -q '.[]' \
+              | jq -s '[ .[] | (.author.login // "") | ascii_downcase ] as $logins
+                       | ($logins | length > 0) and ($logins | all(. == "dependabot[bot]"))')
+
+            if [ "$DEPENDABOT_ONLY" = "true" ]; then
+              echo "Author $AUTHOR is Dependabot and every commit is Dependabot's; exempt from the human-approval gate."
+              exit 0
+            fi
+
+            echo "Author $AUTHOR is Dependabot but the branch has non-Dependabot commits (modified by an agent/human); the exemption does not apply."
+          fi
+
+          IS_HUMAN=$(jq -n --argjson list "$HUMANS_JSON" --arg a "$AUTHOR_LC" \
+            '($list | index($a)) != null')
+
+          # Human-authored PRs need 1 human approval from someone other than
+          # the author; agent PRs need 2 human approvals (the author's own
+          # approval may count, though agent authors are never on the team).
+          if [ "$IS_HUMAN" = "true" ]; then
+            echo "Author $AUTHOR is on team @${ORG}/${TEAM_SLUG}; requiring 1 human approval (not the author)."
+            REQUIRED=1
+            EXCLUDE="$AUTHOR_LC"
+          else
+            echo "Author $AUTHOR is not on team @${ORG}/${TEAM_SLUG}; treating as an agent PR and requiring 2 human approvals."
+            REQUIRED=2
+            EXCLUDE=""
+          fi
+
+          # Only each reviewer's latest review counts: a later
+          # CHANGES_REQUESTED or DISMISSED supersedes an earlier approval.
+          APPROVALS=$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" -q '.[]' \
+            | jq -s --argjson humans "$HUMANS_JSON" --arg exclude "$EXCLUDE" '
+                [ .[]
+                  | select((.user.login | ascii_downcase) as $l | ($humans | index($l)) and $l != $exclude)
+                  | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED") ]
+                | group_by(.user.login | ascii_downcase)
+                | map(max_by(.submitted_at))
+                | map(select(.state == "APPROVED"))
+                | length')
+
+          echo "Human approvals (from team @${ORG}/${TEAM_SLUG}): $APPROVALS"
+          if [ "$APPROVALS" -ge "$REQUIRED" ]; then
+            echo "PR has the required $REQUIRED human approval(s)."
+          else
+            echo "This PR needs $REQUIRED human approval(s); have $APPROVALS."
+            exit 1
+          fi
